@@ -112,11 +112,12 @@ class SearchParams {
   float GetNpsLimit() const { return kNpsLimit; }
   int GetSolidTreeThreshold() const { return kSolidTreeThreshold; }
 
+  bool GetMultiGatherEnabled() const { return kMultiGatherEnabled; }
   int GetTaskWorkersPerSearchWorker() const {
     return kTaskWorkersPerSearchWorker;
   }
   int GetMinimumWorkSizeForProcessing() const {
-    return kMinimWorkSizeForProcessing;
+    return kMinimumWorkSizeForProcessing;
   }
   int GetMinimumWorkSizeForPicking() const {
     return kMinimumWorkSizeForPicking;
@@ -180,8 +181,9 @@ class SearchParams {
   static const OptionId kMaxOutOfOrderEvalsId;
   static const OptionId kNpsLimitId;
   static const OptionId kSolidTreeThresholdId;
+  static const OptionId kMultiGatherEnabledId;
   static const OptionId kTaskWorkersPerSearchWorkerId;
-  static const OptionId kMinimWorkSizeForProcessingId;
+  static const OptionId kMinimumWorkSizeForProcessingId;
   static const OptionId kMinimumWorkSizeForPickingId;
   static const OptionId kMinimumRemainingWorkSizeForPickingId;
   static const OptionId kMinimumWorkPerTaskForProcessingId;
@@ -231,8 +233,9 @@ class SearchParams {
   const int kMaxOutOfOrderEvals;
   const float kNpsLimit;
   const int kSolidTreeThreshold;
+  const bool kMultiGatherEnabled;
   const int kTaskWorkersPerSearchWorker;
-  const int kMinimWorkSizeForProcessing;
+  const int kMinimumWorkSizeForProcessing;
   const int kMinimumWorkSizeForPicking;
   const int kMinimumRemainingWorkSizeForPicking;
   const int kMinimumWorkPerTaskForProcessing;

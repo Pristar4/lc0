@@ -275,10 +275,13 @@ const OptionId SearchParams::kSolidTreeThresholdId{
     "solid-tree-threshold", "SolidTreeThreshold",
     "Only nodes with at least this number of visits will be considered for "
     "solidification for improved cache locality."};
+const OptionId SearchParams::kMultiGatherEnabledId{
+    "multi-gather", "MultiGather",
+    "If enabled, search will be replaced by the multigather approach."};
 const OptionId SearchParams::kTaskWorkersPerSearchWorkerId{
     "task-workers", "TaskWorkers",
     "The number of task workers to use to help the search worker."};
-const OptionId SearchParams::kMinimWorkSizeForProcessingId{
+const OptionId SearchParams::kMinimumWorkSizeForProcessingId{
     "minimum-processing-work", "MinimumProcessingWork",
     "This many visits need to be gathered before tasks will be used to "
     "accelerate processing."};
@@ -294,7 +297,6 @@ const OptionId SearchParams::kMinimumWorkPerTaskForProcessingId{
     "minimum-per-task-processing", "MinimumPerTaskProcessing",
     "Processing work won't be split into chunks smaller than this (unless its "
     "more than half of MinimumProcessingWork)."};
-
 void SearchParams::Populate(OptionsParser* options) {
   // Here the uci optimized defaults" are set.
   // Many of them are overridden with training specific values in tournament.cc.
@@ -328,8 +330,8 @@ void SearchParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kFpuValueAtRootId, -100.0f, 100.0f) = 1.0f;
   options->Add<IntOption>(kCacheHistoryLengthId, 0, 7) = 0;
   options->Add<FloatOption>(kPolicySoftmaxTempId, 0.1f, 10.0f) = 1.607f;
-  options->Add<IntOption>(kMaxCollisionEventsId, 1, 65536) = 1000;
-  options->Add<IntOption>(kMaxCollisionVisitsId, 1, 1000000) = 1000;
+  options->Add<IntOption>(kMaxCollisionEventsId, 1, 65536) = 32;
+  options->Add<IntOption>(kMaxCollisionVisitsId, 1, 1000000) = 9999;
   options->Add<BoolOption>(kOutOfOrderEvalId) = true;
   options->Add<FloatOption>(kMaxOutOfOrderEvalsId, 0.0f, 100.0f) = 1.0f;
   options->Add<BoolOption>(kStickyEndgamesId) = true;
@@ -360,8 +362,9 @@ void SearchParams::Populate(OptionsParser* options) {
   options->Add<IntOption>(kDrawScoreBlackId, -100, 100) = 0;
   options->Add<FloatOption>(kNpsLimitId, 0.0f, 1e6f) = 0.0f;
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
+  options->Add<BoolOption>(kMultiGatherEnabledId) = false;
   options->Add<IntOption>(kTaskWorkersPerSearchWorkerId, 0, 128) = 4;
-  options->Add<IntOption>(kMinimWorkSizeForProcessingId, 2, 100000) = 20;
+  options->Add<IntOption>(kMinimumWorkSizeForProcessingId, 2, 100000) = 20;
   options->Add<IntOption>(kMinimumWorkSizeForPickingId, 1, 100000) = 10;
   options->Add<IntOption>(kMinimumRemainingWorkSizeForPickingId, 0, 100000) =
       20;
@@ -434,10 +437,13 @@ SearchParams::SearchParams(const OptionsDict& options)
                               options.Get<int>(kMiniBatchSizeId)))),
       kNpsLimit(options.Get<float>(kNpsLimitId)),
       kSolidTreeThreshold(options.Get<int>(kSolidTreeThresholdId)),
+      kMultiGatherEnabled(options.Get<bool>(kMultiGatherEnabledId)),
       kTaskWorkersPerSearchWorker(
-          options.Get<int>(kTaskWorkersPerSearchWorkerId)),
-      kMinimWorkSizeForProcessing(
-          options.Get<int>(kMinimWorkSizeForProcessingId)),
+          options.Get<bool>(kMultiGatherEnabledId)
+              ? options.Get<int>(kTaskWorkersPerSearchWorkerId)
+              : 0),
+      kMinimumWorkSizeForProcessing(
+          options.Get<int>(kMinimumWorkSizeForProcessingId)),
       kMinimumWorkSizeForPicking(
           options.Get<int>(kMinimumWorkSizeForPickingId)),
       kMinimumRemainingWorkSizeForPicking(
