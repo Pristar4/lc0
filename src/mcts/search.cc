@@ -840,6 +840,7 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
   stats->average_depth = cum_depth_ / (total_playouts_ ? total_playouts_ : 1);
   stats->edge_n.clear();
   stats->win_found = false;
+  stats->num_losing_edges = 0;
   stats->time_usage_hint_ = IterationStats::TimeUsageHint::kNormal;
 
   // If root node hasn't finished first visit, none of this code is safe.
@@ -853,14 +854,59 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
     const auto m_evaluator = network_->GetCapabilities().has_mlh()
                                  ? MEvaluator(params_, root_node_)
                                  : MEvaluator();
+
+    // For smart pruning in time manager to work as intended when dealing with
+    // transpositions, we subtract the transposition visits for each edge.
+    // Step 1: Create a hash list for the PV up to 4 plies.
+    std::vector<uint64_t> pv_hash_list;
+    EdgeAndNode best_edge = GetBestChildNoTemperature(root_node_, 0);
+    // To make the computation lighter, restrict PV search to top moves.
+    uint32_t pv_visit_threshold = best_edge.GetN() / 10;
+    int hist_length = played_history_.GetLength();
+    unsigned int depth = 0;
+    PositionHistory history_pv = played_history_;
+    for (EdgeAndNode iter = best_edge; iter;
+         iter = GetBestChildNoTemperature(iter.node(), depth)) {
+      if (!iter.node()) break;  // Last edge was dangling, cannot continue.
+      history_pv.Append(iter.GetMove());
+      if (depth > 0) {
+        // There aren't transpositions at 1 ply, so skip the hash calculation.
+        pv_hash_list.push_back(history_pv.Last().Hash());
+      }
+      depth += 1;
+      if (depth >= 4) break; // We only count transpositions until 4 plies.
+    }
     for (const auto& edge : root_node_->Edges()) {
-      const auto n = edge.GetN();
+      // Step 2: For each edge, check whether the PV reaches a position
+      // identical to the best_edge PV at some depth.
+      int n_transpos = 0;
+      unsigned int depth = 0;
+      history_pv.Trim(hist_length);
+      if ((edge != best_edge) && (edge.GetN() > pv_visit_threshold)) {
+        for (EdgeAndNode iter = edge; iter;
+             iter = GetBestChildNoTemperature(iter.node(), depth)) {
+          if (!iter.node()) break;  // Last edge was dangling, cannot continue.
+          history_pv.Append(iter.GetMove());
+          if ((depth > 0) &&
+              (pv_hash_list[depth - 1] == history_pv.Last().Hash())) {
+            n_transpos = iter.GetN();
+            break; // We only care for the first transposition into the PV.
+          }
+          depth += 1;
+          if (depth > pv_hash_list.size()) break;
+      }
+      }
+
+      const auto n = edge.GetN() - n_transpos;
       const auto q = edge.GetQ(fpu, draw_score);
       const auto m = m_evaluator.GetM(edge, q);
       const auto q_plus_m = q + m;
       stats->edge_n.push_back(n);
       if (n > 0 && edge.IsTerminal() && edge.GetWL(0.0f) > 0.0f) {
         stats->win_found = true;
+      }
+      if (n > 0 && edge.IsTerminal() && edge.GetWL(0.0f) < 0.0f) {
+        stats->num_losing_edges += 1;
       }
       if (max_n < n) {
         max_n = n;
@@ -1345,11 +1391,11 @@ void SearchWorker::GatherMinibatch2() {
 }
 
 void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
-                                     TaskWorkspace*) {
+                                     TaskWorkspace* workspace) {
+  auto& history = workspace->history;
   // This code runs multiple passes of work across the same input in order to
   // reduce taking/dropping mutexes in quick succession.
-  PositionHistory history = search_->played_history_;
-  history.Reserve(search_->played_history_.GetLength() + 30);
+  history = search_->played_history_;
 
   // First pass - Extend nodes.
   for (int i = start_idx; i < end_idx; i++) {
@@ -1491,15 +1537,15 @@ void SearchWorker::PickNodesToExtendTask(Node* node, int base_depth,
   // with tasks.
   // TODO: pre-reserve visits_to_perform for expected depth and likely maximum
   // width. Maybe even do so outside of lock scope.
-  std::vector<std::unique_ptr<std::array<int, 256>>> visits_to_perform;
   auto& vtp_buffer = workspace->vtp_buffer;
-  visits_to_perform.reserve(30);
-  std::vector<int> vtp_last_filled;
-  vtp_last_filled.reserve(30);
-  std::vector<int> current_path;
-  current_path.reserve(30);
-  std::vector<Move> moves_to_path = moves_to_base;
-  moves_to_path.reserve(30);
+  auto& visits_to_perform = workspace->visits_to_perform;
+  visits_to_perform.clear();
+  auto& vtp_last_filled = workspace->vtp_last_filled;
+  vtp_last_filled.clear();
+  auto& current_path = workspace->current_path;
+  current_path.clear();
+  auto& moves_to_path = workspace->moves_to_path;
+  moves_to_path = moves_to_base;
   // Sometimes receiver is reused, othertimes not, so only jump start if small.
   if (receiver->capacity() < 30) {
     receiver->reserve(receiver->size() + 30);
@@ -1575,35 +1621,6 @@ void SearchWorker::PickNodesToExtendTask(Node* node, int base_depth,
         // Root node is again special - needs its n in flight updated separately
         // as its not handled on the path to it, since there isn't one.
         node->IncrementNInFlight(cur_limit);
-      }
-      // !is_root_node only for clarity, it can never pass the second condition.
-      if (params_.GetTaskWorkersPerSearchWorker() > 0 && !is_root_node &&
-          cur_limit > params_.GetMinimumWorkSizeForPicking() &&
-          cur_limit <
-              ((collision_limit - passed_off - completed_visits) * 2 / 3) &&
-          cur_limit + passed_off + completed_visits <
-              collision_limit -
-                  params_.GetMinimumRemainingWorkSizeForPicking()) {
-        bool passed = false;
-        {
-          // Multiple writers, so need mutex here.
-          Mutex::Lock lock(picking_tasks_mutex_);
-          // Ensure not to exceed size of reservation.
-          if (picking_tasks_.size() < MAX_TASKS) {
-            picking_tasks_.emplace_back(node,
-                                        current_path.size() - 1 + base_depth,
-                                        moves_to_path, cur_limit);
-            task_count_.fetch_add(1, std::memory_order_acq_rel);
-            task_added_.notify_all();
-            passed = true;
-            passed_off += cur_limit;
-          }
-        }
-        if (passed) {
-          node = node->GetParent();
-          current_path.pop_back();
-          continue;
-        }
       }
 
       // Create visits_to_perform new back entry for this level.
@@ -1785,6 +1802,42 @@ void SearchWorker::PickNodesToExtendTask(Node* node, int base_depth,
         }
       }
       is_root_node = false;
+      // Actively do any splits now rather than waiting for potentially long tree walk to get there.
+      for (int i = 0; i <= vtp_last_filled.back(); i++) {
+        int child_limit = (*visits_to_perform.back())[i];
+        if (params_.GetTaskWorkersPerSearchWorker() > 0 &&
+            child_limit > params_.GetMinimumWorkSizeForPicking() &&
+            child_limit <
+                ((collision_limit - passed_off - completed_visits) * 2 / 3) &&
+            child_limit + passed_off + completed_visits <
+                collision_limit -
+                    params_.GetMinimumRemainingWorkSizeForPicking()) {
+          Node* child_node = cur_iters[i].GetOrSpawnNode(/* parent */ node);
+          // Don't split if not expanded or terminal.
+          if (child_node->GetN() == 0 || child_node->IsTerminal()) continue;
+
+          bool passed = false;
+          {
+            // Multiple writers, so need mutex here.
+            Mutex::Lock lock(picking_tasks_mutex_);
+            // Ensure not to exceed size of reservation.
+            if (picking_tasks_.size() < MAX_TASKS) {
+              moves_to_path.push_back(cur_iters[i].GetMove());
+              picking_tasks_.emplace_back(child_node,
+                                          current_path.size() - 1 + base_depth + 1,
+                                          moves_to_path, child_limit);
+              moves_to_path.pop_back();
+              task_count_.fetch_add(1, std::memory_order_acq_rel);
+              task_added_.notify_all();
+              passed = true;
+              passed_off += child_limit;
+            }
+          }
+          if (passed) {
+            (*visits_to_perform.back())[i] = 0;
+          }
+        }        
+      }
       // Fall through to select the first child.
     }
     int min_idx = current_path.back();
