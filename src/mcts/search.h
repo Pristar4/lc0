@@ -226,7 +226,7 @@ class SearchWorker {
   ~SearchWorker() {
     {
       task_count_.store(-1, std::memory_order_release);
-      Mutex::Lock lock(picking_tasks_mutex_);
+      std::unique_lock<std::mutex> lock(picking_tasks_mutex_);
       exiting_ = true;
       task_added_.notify_all();
     }
@@ -306,15 +306,22 @@ class SearchWorker {
     // Estimated remaining plies left.
     float m;
     int multivisit = 0;
-    // If greater than multivisit, and other parameters don't imply a lower
-    // limit, multivist could be increased to this value without additional
-    // change in outcome of next selection.
     int maxvisit = 0;
     uint16_t depth;
     bool nn_queried = false;
     bool is_cache_hit = false;
     bool is_collision = false;
     int probability_transform = 0;
+    // Only populated for visits,
+    std::vector<Move> moves_to_visit;
+
+    // Details that are filled in as we go.
+    uint64_t hash;
+    NNCacheLock lock;
+    std::vector<uint16_t> probabilities_to_cache;
+    InputPlanes input_planes;
+    mutable int last_idx = 0;
+    bool ooo_completed = false;
 
     // Details only populated in the multigather path.
 
@@ -330,10 +337,6 @@ class SearchWorker {
     bool ooo_completed = false;
 
     static NodeToProcess Collision(Node* node, uint16_t depth,
-                                   int collision_count) {
-      return NodeToProcess(node, depth, true, collision_count, 0);
-    }
-    static NodeToProcess Collision(Node* node, uint16_t depth,
                                    int collision_count, int max_count) {
       return NodeToProcess(node, depth, true, collision_count, max_count);
     }
@@ -342,7 +345,7 @@ class SearchWorker {
     }
 
     // Methods to allow NodeToProcess to conform as a 'Computation'. Only safe
-    // to call if is_cache_hit is true in the multigather path.
+    // to call if is_cache_hit is true.
 
     float GetQVal(int) const { return lock->q; }
 
@@ -367,94 +370,48 @@ class SearchWorker {
 
    private:
     NodeToProcess(Node* node, uint16_t depth, bool is_collision, int multivisit,
-                  int max_count)
+                  int maxvisit)
         : node(node),
           multivisit(multivisit),
-          maxvisit(max_count),
+          maxvisit(maxvisit),
           depth(depth),
           is_collision(is_collision) {}
   };
-
   // Holds per task worker scratch data
   struct TaskWorkspace {
-    std::array<Node::Iterator, 256> cur_iters;
-    std::vector<std::unique_ptr<std::array<int, 256>>> vtp_buffer;
-    std::vector<std::unique_ptr<std::array<int, 256>>> visits_to_perform;
-    std::vector<int> vtp_last_filled;
-    std::vector<int> current_path;
-    std::vector<Move> moves_to_path;
-    PositionHistory history;
-    TaskWorkspace() {
-      vtp_buffer.reserve(30);
-      visits_to_perform.reserve(30);
-      vtp_last_filled.reserve(30);
-      current_path.reserve(30);
-      moves_to_path.reserve(30);
-      history.Reserve(30);
-    }
+    Node::Iterator cur_iters[256];
+    std::vector<std::unique_ptr<int[]>> vtp_buffer;
   };
 
-  struct PickTask {
-    enum PickTaskType { kGathering, kProcessing };
-    PickTaskType task_type;
-
-    // For task type gathering.
-    Node* start;
-    int base_depth;
-    int collision_limit;
-    std::vector<Move> moves_to_base;
-    std::vector<NodeToProcess> results;
-
-    // Task type post gather processing.
-    int start_idx;
-    int end_idx;
-
-    bool complete = false;
-
-    PickTask(Node* node, uint16_t depth, const std::vector<Move>& base_moves,
-             int collision_limit)
-        : task_type(kGathering),
-          start(node),
-          base_depth(depth),
-          collision_limit(collision_limit),
-          moves_to_base(base_moves) {}
-    PickTask(int start_idx, int end_idx)
-        : task_type(kProcessing), start_idx(start_idx), end_idx(end_idx) {}
-  };
-
-  NodeToProcess PickNodeToExtend(int collision_limit);
-  void ExtendNode(Node* node, int depth);
-  bool AddNodeToComputation(Node* node, bool add_if_cached, int* transform_out);
-  int PrefetchIntoCache(Node* node, int budget, bool is_odd_depth);
-  void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process);
-  // Returns whether a node's bounds were set based on its children.
-  bool MaybeSetBounds(Node* p, float m, int* n_to_fix, float* v_delta,
-                      float* d_delta, float* m_delta) const;
   void PickNodesToExtend(int collision_limit);
   void PickNodesToExtendTask(Node* starting_point, int collision_limit,
                              int base_depth,
                              const std::vector<Move>& moves_to_base,
                              std::vector<NodeToProcess>* receiver,
                              TaskWorkspace* workspace);
-  void EnsureNodeTwoFoldCorrectForDepth(Node* node, int depth);
   void ProcessPickedTask(int batch_start, int batch_end,
                          TaskWorkspace* workspace);
   void ExtendNode(Node* node, int depth, const std::vector<Move>& moves_to_add,
                   PositionHistory* history);
+  bool AddNodeToComputation(Node* node, bool add_if_cached, int* transform_out,
+                            PositionHistory* history);
+  int PrefetchIntoCache(Node* node, int budget, bool is_odd_depth);
   template <typename Computation>
   void FetchSingleNodeResult(NodeToProcess* node_to_process,
                              const Computation& computation,
                              int idx_in_computation);
+  void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process);
+  // Returns whether a node's bounds were set based on its children.
+  bool MaybeSetBounds(Node* p, float m, int* n_to_fix, float* v_delta,
+                      float* d_delta, float* m_delta) const;
+
   void RunTasks(int tid);
-  void ResetTasks();
-  // Returns how many tasks there were.
-  int WaitForTasks();
 
   Search* const search_;
   // List of nodes to process.
   std::vector<NodeToProcess> minibatch_;
   std::unique_ptr<CachingComputation> computation_;
-  // History is reset and extended by PickNodeToExtend().
+  // History is reset and extended by PrefetchIntoCache().
   PositionHistory history_;
   int number_out_of_order_ = 0;
   const SearchParams& params_;
@@ -463,13 +420,36 @@ class SearchWorker {
   IterationStats iteration_stats_;
   StoppersHints latest_time_manager_hints_;
 
-  // Multigather task related fields.
+  struct PickTask {
+    int task_type;
 
-  Mutex picking_tasks_mutex_;
+    // For task type 0 - gathering.
+    Node* start;
+    int base_depth;
+    int collision_limit;
+    std::vector<NodeToProcess> results;
+    std::vector<Move> moves_to_base;
+
+    // Task type 1 - post gather processing.
+    int start_idx;
+    int end_idx;
+
+    bool complete = false;
+    PickTask(Node* node, uint16_t depth, const std::vector<Move>& base_moves,
+             int collision_limit)
+        : task_type(0),
+          start(node),
+          collision_limit(collision_limit),
+          base_depth(depth),
+          moves_to_base(base_moves) {}
+    PickTask(int start_idx, int end_idx)
+        : task_type(1), start_idx(start_idx), end_idx(end_idx) {}
+  };
+  std::mutex picking_tasks_mutex_;
   std::vector<PickTask> picking_tasks_;
   std::atomic<int> task_count_ = -1;
-  std::atomic<int> task_taking_started_ = 0;
-  std::atomic<int> tasks_taken_ = 0;
+  std::atomic<int> task_taker_ = 0;
+  std::atomic<int> next_task_available_ = 0;
   std::atomic<int> completed_tasks_ = 0;
   std::condition_variable task_added_;
   std::vector<std::thread> task_threads_;
